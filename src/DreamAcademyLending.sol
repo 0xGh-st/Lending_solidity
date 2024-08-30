@@ -30,9 +30,9 @@ contract DreamAcademyLending is ERC20 {
 
     uint256 public immutable BLOCKS_PER_DAY = 7200; // 7200 blocks per day
     uint256 public immutable INTEREST_RATE = 1e15; // 24-hour interest rate of 0.1% compounded
-    uint256 public immutable LTV = 50; // 50% Loan-to-Value ratio
-    uint256 public immutable LIQUIDATION_THRESHOLD = 75; // LIQUIDATION_THRESHOLD% Liquidation threshold
-    uint256 public immutable WAD = 10**18; // FixedPointMathLib's WAD constant
+    uint256 public immutable LTV = 50; // 50% LTV
+    uint256 public immutable LIQUIDATION_THRESHOLD = 75;
+    uint256 public immutable decimal = 10**18;
 
     event Deposit(address indexed user, uint256 amount);
     event Borrow(address indexed user, uint256 amount);
@@ -218,10 +218,10 @@ contract DreamAcademyLending is ERC20 {
     }
 
     function _getInterest(uint256 _p, uint256 _r, uint256 _n) internal pure returns (uint256) {
-        uint256 _rate = _r + WAD;
+        uint256 _rate = _r + decimal;
         uint256 _compounded = _p;
         for (uint256 _i = 0; _i < _n; _i++) {
-            _compounded = (_compounded * _rate) / WAD;
+            _compounded = (_compounded * _rate) / decimal;
         }
         return _compounded;
     }
