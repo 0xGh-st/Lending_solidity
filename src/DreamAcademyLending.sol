@@ -1,200 +1,245 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 interface IPriceOracle {
     function getPrice(address token) external view returns (uint256);
 }
 
-contract DreamAcademyLending {
+contract DreamAcademyLending is ERC20 {
     IPriceOracle public priceOracle;
-    address public stableCoin;
-    uint256 public reserve; // Track the reserve in ETH
-    uint256 public totalSupply;
-    uint256 public totalBorrows;
-    uint256 public constant LIQUIDATION_THRESHOLD = 75; // 75%
-    uint256 public constant LIQUIDATION_BONUS = 110; // 10% bonus for liquidators
-
-    // 블록당 이자율을 계산한 상수
-    uint256 public constant BLOCK_INTEREST_RATE = 1000000000000000000 + ((1000000000000000000 * 1) / 7200000); // 블록당 0.1% 복리 이자율 / 7200
+    address public USDC;
 
     struct Account {
-        uint256 collateralETH;
+        uint256 collateral;
+        uint256 balance;
         uint256 debt;
-        uint256 lastUpdate;
-        uint256 suppliedERC20; // Track supplied ERC20 for interest calculation
+        uint256 blockNum;
+        uint256 reserves;
     }
 
+    struct Update {
+        uint256 interestRate;
+        uint256 cacheInterestRate;
+        address[] actors;
+    }
+
+    Update public update;
     mapping(address => Account) public accounts;
 
-    event Deposit(address indexed user, address indexed asset, uint256 amount);
-    event Withdraw(address indexed user, address indexed asset, uint256 amount);
+    uint256 public immutable BLOCKS_PER_DAY = 7200; // 7200 blocks per day
+    uint256 public immutable INTEREST_RATE = 1e15; // 24-hour interest rate of 0.1% compounded
+    uint256 public immutable LTV = 50; // 50% Loan-to-Value ratio
+    uint256 public immutable LIQUIDATION_THRESHOLD = 75; // LIQUIDATION_THRESHOLD% Liquidation threshold
+    uint256 public immutable WAD = 10**18; // FixedPointMathLib's WAD constant
+
+    event Deposit(address indexed user, uint256 amount);
     event Borrow(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
     event Repay(address indexed user, uint256 amount);
-    event Liquidate(address indexed liquidator, address indexed user, uint256 repayAmount);
+    event Liquidate(address indexed user, uint256 amount);
 
-    constructor(IPriceOracle _priceOracle, address _stableCoin) {
+    constructor(IPriceOracle _priceOracle, address _usdc) ERC20("DreamAcademyLending", "DAL") {
         priceOracle = _priceOracle;
-        stableCoin = _stableCoin;
+        USDC = _usdc;
     }
 
-    // Modifier to ensure account updates for interest calculations
-    modifier updateAccount(address user) {
-        if (accounts[user].lastUpdate > 0) {
-            accounts[user].suppliedERC20 += pendingInterest(user);
-        }
-        accounts[user].lastUpdate = block.number; // 블록 단위로 변경
-        _;
+    function initializeLendingProtocol(address _usdc) external payable {
+        require(msg.value > 0, "initializeLendingProtocol: Failed");
+        ERC20(_usdc).transferFrom(msg.sender, address(this), 1);
     }
 
-    // Initialize the lending protocol with a reserve, should be exactly 1 wei
-    function initializeLendingProtocol(address token) external payable {
-        require(msg.value == 1, "Initial reserve must be 1");
-        require(reserve == 0, "Protocol already initialized");
-        reserve = msg.value; // Set the reserve to the amount of ether sent
-        if (token != address(0)) {
-            require(ERC20(token).transferFrom(msg.sender, address(this), msg.value));
-        }
-    }
+    function deposit(address _tokenAddress, uint256 _amount) external payable {
+        require(_amount > 0, "deposit: Failed");
 
-    // Deposit function for ETH or ERC20 tokens
-    function deposit(address asset, uint256 amount) external payable updateAccount(msg.sender) {
-        require(amount > 0, "Amount must be greater than 0");
-
-        if (asset == address(0)) {
-            require(msg.value == amount, "Ether amount mismatch");
-            accounts[msg.sender].collateralETH += amount;
-        } else if (asset == stableCoin) {
-            require(msg.value == 0, "Ether not needed for ERC20 deposit");
-            ERC20(asset).transferFrom(msg.sender, address(this), amount);
-            accounts[msg.sender].suppliedERC20 += amount; // Track supplied ERC20
+        if (_tokenAddress == address(0)) {
+            require(msg.value >= _amount, "deposit: Failed");
+            accounts[msg.sender].collateral += _amount;
         } else {
-            revert("Unsupported asset");
+            _updateProtocol(USDC);
+            accounts[msg.sender].balance += _amount;
+            update.actors.push(msg.sender);
+            ERC20(USDC).transferFrom(msg.sender, address(this), _amount);
         }
 
-        emit Deposit(msg.sender, asset, amount);
+        emit Deposit(msg.sender, _amount);
     }
 
-    // Ensure correct collateral checks for withdrawals
-    function withdraw(address asset, uint256 amount) external updateAccount(msg.sender) {
-        require(amount > 0, "Amount must be greater than 0");
+    function borrow(address _tokenAddress, uint256 _amount) external {
+        require(_tokenAddress == USDC, "borrow: Failed");
+        uint256 _ethCollateral = accounts[msg.sender].collateral;
+        uint256 _maxBorrow = _getMaxBorrowAmount(_ethCollateral);
+        require(_amount <= _maxBorrow, "borrow: Failed");
+        uint256 _maxBorrowAddress = _getMaxBorrowCurrentDebtCheck(msg.sender);
+        require(_amount <= _maxBorrowAddress, "borrow: Failed");
 
-        if (asset == address(0)) {
-            require(accounts[msg.sender].collateralETH >= amount, "Insufficient ETH collateral");
-            require(isWithdrawAllowed(msg.sender, amount, true), "Withdraw exceeds collateral");
-            accounts[msg.sender].collateralETH -= amount;
-            payable(msg.sender).transfer(amount);
-        } else if (asset == stableCoin) {
-            require(accounts[msg.sender].suppliedERC20 >= amount, "Insufficient ERC20 collateral");
-            require(isWithdrawAllowed(msg.sender, amount, false), "Withdraw exceeds collateral");
-            accounts[msg.sender].suppliedERC20 -= amount;
-            ERC20(asset).transfer(msg.sender, amount);
+        (uint256 _ethPrice, uint256 _usdcPrice) = _getCurrentPrices();
+        require((_ethPrice * accounts[msg.sender].collateral / 2) >= (_usdcPrice * (accounts[msg.sender].debt + _amount)), "borrow: Failed");
+        ERC20(USDC).transfer(msg.sender, _amount);
+        accounts[msg.sender].debt += _amount;
+        accounts[msg.sender].blockNum = block.number;
+        update.actors.push(msg.sender);
+        emit Borrow(msg.sender, _amount);
+    }
+
+    function repay(address _tokenAddress, uint256 _amount) external {
+        require(_tokenAddress == USDC, "repay: Failed");
+        require(_amount > 0, "repay: Failed");
+
+        uint256 _interest = _calcInterest(msg.sender);
+        accounts[msg.sender].debt += _interest;
+        require(accounts[msg.sender].debt >= _amount, "repay: Failed");
+        accounts[msg.sender].debt -= _amount;
+        ERC20(USDC).transferFrom(msg.sender, address(this), _amount);
+        emit Repay(msg.sender, _amount);
+    }
+
+    function liquidate(address _user, address _tokenAddress, uint256 _amount) external {
+        require(_amount > 0, "liquidate: Failed");
+        require(msg.sender != _user, "liquidate: Failed");
+        require(_tokenAddress == USDC, "liquidate: Failed");
+        require(!_isHealthy(_user), "liquidate: Failed");
+
+        (uint256 _ethPrice, uint256 _usdcPrice) = _getCurrentPrices();
+        require((_ethPrice * accounts[_user].collateral * LIQUIDATION_THRESHOLD / 100) < (accounts[_user].debt * _usdcPrice), "liquidate: Failed");
+        require(accounts[_user].debt * 25 / 100 >= _amount, "liquidate: Failed");
+
+        uint256 _ethAmountToTransfer = _amount * accounts[_user].collateral / accounts[_user].debt;
+        accounts[_user].debt -= _amount;
+        ERC20(USDC).transferFrom(msg.sender, address(this), _amount);
+        payable(msg.sender).transfer(_ethAmountToTransfer);
+        emit Liquidate(_user, _amount);
+    }
+
+    function withdraw(address _tokenAddress, uint256 _amount) external {
+        require(_amount > 0, "withdraw: Failed");
+        require(accounts[msg.sender].balance > 0 || accounts[msg.sender].collateral > 0, "withdraw: Failed");
+
+        uint256 _interest = _calcInterest(msg.sender);
+
+        if (_tokenAddress == address(0)) {
+            require(accounts[msg.sender].collateral >= _amount, "withdraw: Failed");
+
+            if (accounts[msg.sender].debt == 0) {
+                accounts[msg.sender].collateral -= _amount;
+                payable(msg.sender).transfer(_amount);
+            } else {
+                (uint256 _ethPrice, uint256 _usdcPrice) = _getCurrentPrices();
+                uint256 _newCollateral = accounts[msg.sender].collateral - _amount;
+
+                require(_newCollateral <= accounts[msg.sender].collateral, "withdraw: Failed");
+
+                require(
+                    _ethPrice * _newCollateral * LIQUIDATION_THRESHOLD / 100 >= accounts[msg.sender].debt * _usdcPrice,
+                    "withdraw: Failed"
+                );
+
+                accounts[msg.sender].collateral = _newCollateral;
+                payable(msg.sender).transfer(_amount);
+            }
         } else {
-            revert("Unsupported asset");
+            uint256 _accruedSupply = getAccruedSupplyAmount(USDC);
+
+            require(accounts[msg.sender].balance + _accruedSupply >= _amount, "withdraw: Failed");
+
+            accounts[msg.sender].balance -= _amount;
+            ERC20(USDC).transfer(msg.sender, _amount);
         }
 
-        emit Withdraw(msg.sender, asset, amount);
+        emit Withdraw(msg.sender, _amount);
     }
 
-    // Check collateral adequacy when borrowing
-    function borrow(address asset, uint256 amount) external updateAccount(msg.sender) {
-        require(asset == stableCoin, "Unsupported asset for borrowing");
-        require(amount > 0, "Amount must be greater than 0");
+    function getAccruedSupplyAmount(address _usdc) public returns (uint256) {
+        _updateProtocol(address(0));
+        uint256 _usdcBalance = ERC20(_usdc).balanceOf(address(this));
+        uint256 _userBalance = accounts[msg.sender].balance;
+        uint256 _reserves = accounts[msg.sender].reserves;
 
-        // Fetch collateral values in USD equivalent using price oracle
-        uint256 collateralValueETH = (accounts[msg.sender].collateralETH * priceOracle.getPrice(address(0))) / 1e18;
+        uint256 _accruedInterest = 0;
+        if (_usdcBalance > 0 && update.interestRate > update.cacheInterestRate) {
+            _accruedInterest = ((update.interestRate - update.cacheInterestRate) * _userBalance) / _usdcBalance;
+        }
 
-        // Calculate current debt in USD equivalent
-        uint256 currentDebtUSD = (accounts[msg.sender].debt * priceOracle.getPrice(stableCoin)) / 1e18;
+        uint256 _accruedSupply = _userBalance + _reserves + _accruedInterest;
 
-        // Calculate the new total debt in USD equivalent after adding the borrow amount
-        uint256 newTotalDebtUSD = currentDebtUSD + ((amount * priceOracle.getPrice(stableCoin)) / 1e18);
+        require(_accruedSupply >= _userBalance && _accruedSupply >= _reserves, "getAccruedSupplyAmount: Failed");
 
-        // Ensure the collateral value is at least 150% of the new total debt value (66.66% LTV)
-        require(collateralValueETH * 100 > newTotalDebtUSD * 150, "Insufficient collateral for borrowing");
-
-        // Update debt and perform the transfer
-        accounts[msg.sender].debt += amount;
-        totalBorrows += amount;
-        ERC20(asset).transfer(msg.sender, amount);
-
-        emit Borrow(msg.sender, amount);
+        return _accruedSupply;
     }
+    
+    function _updateProtocol(address _usdc) internal {
+        uint256 _actorsLen = update.actors.length;
+        uint256 _interestRate = update.interestRate;
 
-    // Repay function for ERC20 tokens
-    function repay(address asset, uint256 amount) external updateAccount(msg.sender) {
-        require(asset == stableCoin, "Unsupported asset for repayment");
-        require(amount > 0, "Amount must be greater than 0");
-        require(accounts[msg.sender].debt >= amount, "Repayment exceeds debt");
-
-        ERC20(asset).transferFrom(msg.sender, address(this), amount);
-        accounts[msg.sender].debt -= amount;
-        totalBorrows -= amount;
-
-        emit Repay(msg.sender, amount);
-    }
-
-    // Correct liquidation checks and logic
-    function liquidate(address user, address asset, uint256 amount) external {
-        require(asset == stableCoin, "Unsupported asset for liquidation");
-        require(amount > 0, "Amount must be greater than 0");
-
-        uint256 collateralValueETH = accounts[user].collateralETH * priceOracle.getPrice(address(0)) / 1e18;
-        uint256 debtValue = accounts[user].debt * priceOracle.getPrice(stableCoin) / 1e18;
-
-        require(debtValue * 100 > collateralValueETH * 100 / LIQUIDATION_THRESHOLD, "Loan is healthy, cannot liquidate");
-
-        uint256 repayAmount = amount > accounts[user].debt ? accounts[user].debt : amount;
-        ERC20(asset).transferFrom(msg.sender, address(this), repayAmount);
-
-        accounts[user].debt -= repayAmount;
-        totalBorrows -= repayAmount;
-
-        uint256 collateralToSeize = repayAmount * LIQUIDATION_BONUS / 100;
-        if (accounts[user].collateralETH >= collateralToSeize) {
-            accounts[user].collateralETH -= collateralToSeize;
-            payable(msg.sender).transfer(collateralToSeize);
+        if (_usdc != address(0)) {
+            uint256 _totalUsdcBalance = ERC20(_usdc).balanceOf(address(this));
+            uint256 _cacheInterestRate = _interestRate;
+            for (uint256 _i = 0; _i < _actorsLen; _i++) {
+                address _addr = update.actors[_i];
+                uint256 _reserves = (_interestRate * accounts[_addr].balance) / _totalUsdcBalance;
+                accounts[_addr].reserves = _reserves;
+            }
+            update.cacheInterestRate = _cacheInterestRate;
         } else {
-            uint256 remainingSeize = collateralToSeize - accounts[user].collateralETH;
-            accounts[user].collateralETH = 0;
-            accounts[user].suppliedERC20 -= remainingSeize * 1e18 / priceOracle.getPrice(stableCoin);
-            ERC20(stableCoin).transfer(msg.sender, remainingSeize);
+            for(uint256 _i = 0; _i < _actorsLen; _i++) {
+                address _user = update.actors[_i];
+                _interestRate += _calcInterest(_user);
+            }
         }
-
-        emit Liquidate(msg.sender, user, repayAmount);
+        update.interestRate = _interestRate;
     }
 
-    // Helper function to calculate pending interest
-    function pendingInterest(address user) public view returns (uint256) {
-        if (accounts[user].lastUpdate == 0) return 0; // Avoid division by zero
+    function _getCurrentPrices() internal view returns (uint256 _ethPrice, uint256 _usdcPrice) {
+        _ethPrice = priceOracle.getPrice(address(0));
+        _usdcPrice = priceOracle.getPrice(USDC);
+    }
 
-        uint256 blocksElapsed = block.number - accounts[user].lastUpdate;
-        uint256 interest = accounts[user].suppliedERC20;
+    function _getMaxBorrowAmount(uint256 _collateral) internal view returns (uint256) {
+        uint256 _collateralValueInUsdc = _collateral * priceOracle.getPrice(address(0)) / 1e18;
+        return (_collateralValueInUsdc * LTV) / 100;
+    }
 
-        // 복리 계산
-        for (uint256 i = 0; i < blocksElapsed; i++) {
-            interest = interest * BLOCK_INTEREST_RATE / 1e18;
+    function _getMaxBorrowCurrentDebtCheck(address _user) internal view returns (uint256) {
+        uint256 _ethCollateral = accounts[_user].collateral;
+        uint256 _collateralValueInUsdc = _ethCollateral * priceOracle.getPrice(address(0)) / 1e18;
+        uint256 _maxBorrowAmount = (_collateralValueInUsdc * LTV) / 100;
+        uint256 _currentDebt = accounts[_user].debt;
+
+        return _maxBorrowAmount > _currentDebt ? _maxBorrowAmount - _currentDebt : 0;
+    }
+
+    function _isHealthy(address _user) internal view returns (bool) {
+        uint256 _currentDebt = accounts[_user].debt;
+        uint256 _ethCollateral = accounts[_user].collateral;
+        uint256 _maxBorrowAmount = _getMaxBorrowAmount(_ethCollateral);
+
+        return _currentDebt <= _maxBorrowAmount;
+    }
+
+    function _getInterest(uint256 _p, uint256 _r, uint256 _n) internal pure returns (uint256) {
+        uint256 _rate = _r + WAD;
+        uint256 _compounded = _p;
+        for (uint256 _i = 0; _i < _n; _i++) {
+            _compounded = (_compounded * _rate) / WAD;
         }
-
-        return interest - accounts[user].suppliedERC20;
+        return _compounded;
     }
 
-    // Check if withdraw is allowed based on collateral and debt
-    function isWithdrawAllowed(address user, uint256 withdrawAmount, bool isETH) public view returns (bool) {
-        uint256 collateralValueETH = (accounts[user].collateralETH - (isETH ? withdrawAmount : 0)) * priceOracle.getPrice(address(0)) / 1e18;
-        uint256 debtValue = accounts[user].debt * priceOracle.getPrice(stableCoin) / 1e18;
-
-        return debtValue * 100 <= collateralValueETH * 100 / LIQUIDATION_THRESHOLD;
-    }
-
-    // Check for correct interest accrual and withdrawal
-    function getAccruedSupplyAmount(address token) external view returns (uint256) {
-        if (token == stableCoin) {
-            return accounts[msg.sender].suppliedERC20 + pendingInterest(msg.sender);
-        } else {
-            return 0; // Unsupported token for this calculation
+    function _calcInterest(address _user) internal returns (uint256) {
+        uint256 _distance = block.number - accounts[_user].blockNum;
+        uint256 _blockPerDay = _distance / BLOCKS_PER_DAY;
+        uint256 _blockPerDayLast = _distance % BLOCKS_PER_DAY;
+        uint256 _currentDebt = accounts[_user].debt;
+        uint256 _compoundInterestDebt = _getInterest(_currentDebt, INTEREST_RATE, _blockPerDay);
+        if (_blockPerDayLast != 0) {
+            _compoundInterestDebt += (_getInterest(_compoundInterestDebt, INTEREST_RATE, 1) - _compoundInterestDebt) * _blockPerDayLast / BLOCKS_PER_DAY;
         }
+        uint256 _compound = _compoundInterestDebt > _currentDebt ? _compoundInterestDebt - _currentDebt : 0;
+        accounts[_user].debt = _compoundInterestDebt;
+        accounts[_user].blockNum = block.number;
+        return _compound;
     }
+
+    receive() external payable {}
 }
-
